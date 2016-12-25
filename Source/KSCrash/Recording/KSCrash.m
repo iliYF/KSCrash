@@ -25,45 +25,21 @@
 //
 
 
-#import "KSCrashAdvanced.h"
+#import "KSCrash.h"
 
-#import "ARCSafe_MemMgmt.h"
 #import "KSCrashC.h"
-#import "KSCrashCallCompletion.h"
-#import "KSCrashState.h"
+#import "KSCrashDoctor.h"
+#import "KSCrashReportFields.h"
+#import "KSCrashMonitor_AppState.h"
 #import "KSJSONCodecObjC.h"
-#import "KSSingleton.h"
 #import "NSError+SimpleConstructor.h"
 
 //#define KSLogger_LocalLevel TRACE
 #import "KSLogger.h"
 
-#ifdef __IPHONE_OS_VERSION_MAX_ALLOWED
+#if KSCRASH_HAS_UIKIT
 #import <UIKit/UIKit.h>
 #endif
-
-
-// ============================================================================
-#pragma mark - Default Constants -
-// ============================================================================
-
-/** The maximum number of reports to keep on disk. */
-#ifndef KSCRASH_MaxStoredReports
-    #define KSCRASH_MaxStoredReports 5
-#endif
-
-/** The directory under "Caches" to store the crash reports. */
-#ifndef KSCRASH_ReportFilesDirectory
-    #define KSCRASH_ReportFilesDirectory @"KSCrashReports"
-#endif
-
-
-// ============================================================================
-#pragma mark - Constants -
-// ============================================================================
-
-#define kCrashLogFilenameSuffix "-CrashLog.txt"
-#define kCrashStateFilenameSuffix "-CrashState.json"
 
 
 // ============================================================================
@@ -73,19 +49,40 @@
 @interface KSCrash ()
 
 @property(nonatomic,readwrite,retain) NSString* bundleName;
-@property(nonatomic,readwrite,retain) NSString* nextCrashID;
-@property(nonatomic,readonly,retain) NSString* crashReportPath;
-@property(nonatomic,readonly,retain) NSString* recrashReportPath;
-@property(nonatomic,readonly,retain) NSString* stateFilePath;
-
-// Mirrored from KSCrashAdvanced.h to provide ivars
-@property(nonatomic,readwrite,retain) id<KSCrashReportFilter> sink;
-@property(nonatomic,readwrite,retain) NSString* logFilePath;
-@property(nonatomic,readwrite,retain) KSCrashReportStore* crashReportStore;
-@property(nonatomic,readwrite,assign) KSReportWriteCallback onCrash;
-@property(nonatomic,readwrite,assign) bool printTraceToStdout;
+@property(nonatomic,readwrite,retain) NSString* basePath;
 
 @end
+
+
+static NSString* getBundleName()
+{
+    NSString* bundleName = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleName"];
+    if(bundleName == nil)
+    {
+        bundleName = @"Unknown";
+    }
+    return bundleName;
+}
+
+static NSString* getBasePath()
+{
+    NSArray* directories = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                               NSUserDomainMask,
+                                                               YES);
+    if([directories count] == 0)
+    {
+        KSLOG_ERROR(@"Could not locate cache directory path.");
+        return nil;
+    }
+    NSString* cachePath = [directories objectAtIndex:0];
+    if([cachePath length] == 0)
+    {
+        KSLOG_ERROR(@"Could not locate cache directory path.");
+        return nil;
+    }
+    NSString* pathEnd = [@"KSCrash" stringByAppendingPathComponent:getBundleName()];
+    return [cachePath stringByAppendingPathComponent:pathEnd];
+}
 
 
 @implementation KSCrash
@@ -97,83 +94,54 @@
 @synthesize sink = _sink;
 @synthesize userInfo = _userInfo;
 @synthesize deleteBehaviorAfterSendAll = _deleteBehaviorAfterSendAll;
-@synthesize handlingCrashTypes = _handlingCrashTypes;
-@synthesize zombieCacheSize = _zombieCacheSize;
+@synthesize monitoring = _monitoring;
 @synthesize deadlockWatchdogInterval = _deadlockWatchdogInterval;
-@synthesize printTraceToStdout = _printTraceToStdout;
 @synthesize onCrash = _onCrash;
-@synthesize crashReportStore = _crashReportStore;
 @synthesize bundleName = _bundleName;
-@synthesize logFilePath = _logFilePath;
-@synthesize nextCrashID = _nextCrashID;
+@synthesize basePath = _basePath;
 @synthesize searchThreadNames = _searchThreadNames;
 @synthesize searchQueueNames = _searchQueueNames;
 @synthesize introspectMemory = _introspectMemory;
+@synthesize catchZombies = _catchZombies;
 @synthesize doNotIntrospectClasses = _doNotIntrospectClasses;
+@synthesize demangleLanguages = _demangleLanguages;
+@synthesize addConsoleLogToReport = _addConsoleLogToReport;
 
 
 // ============================================================================
 #pragma mark - Lifecycle -
 // ============================================================================
 
-IMPLEMENT_EXCLUSIVE_SHARED_INSTANCE(KSCrash)
++ (instancetype) sharedInstance
+{
+    static KSCrash *sharedInstance = nil;
+    static dispatch_once_t onceToken;
+    
+    dispatch_once(&onceToken, ^{
+        sharedInstance = [[KSCrash alloc] init];
+    });
+    return sharedInstance;
+}
 
 - (id) init
 {
     if((self = [super init]))
     {
-        self.bundleName = [[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleName"];
-
-        NSArray* directories = NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
-                                                                   NSUserDomainMask,
-                                                                   YES);
-        if([directories count] == 0)
+        self.bundleName = getBundleName();
+        self.basePath = getBasePath();
+        if(self.basePath == nil)
         {
-            KSLOG_ERROR(@"Could not locate cache directory path.");
-            goto failed;
+            KSLOG_ERROR(@"Failed to initialize crash handler. Crash reporting disabled.");
+            return nil;
         }
-        NSString* cachePath = [directories objectAtIndex:0];
-        if([cachePath length] == 0)
-        {
-            KSLOG_ERROR(@"Could not locate cache directory path.");
-            goto failed;
-        }
-        NSString* storePathEnd = [KSCRASH_ReportFilesDirectory stringByAppendingPathComponent:self.bundleName];
-        NSString* storePath = [cachePath stringByAppendingPathComponent:storePathEnd];
-        if([storePath length] == 0)
-        {
-            KSLOG_ERROR(@"Could not determine report files path.");
-            goto failed;
-        }
-        if(![self ensureDirectoryExists:storePath])
-        {
-            goto failed;
-        }
-
-        self.nextCrashID = [self generateUUIDString];
-        self.crashReportStore = [KSCrashReportStore storeWithPath:storePath];
         self.deleteBehaviorAfterSendAll = KSCDeleteAlways;
         self.searchThreadNames = NO;
         self.searchQueueNames = NO;
         self.introspectMemory = YES;
+        self.catchZombies = NO;
+        self.monitoring = KSCrashMonitorTypeProductionSafeMinimal;
     }
     return self;
-
-failed:
-    KSLOG_ERROR(@"Failed to initialize crash handler. Crash reporting disabled.");
-    as_release(self);
-    return nil;
-}
-
-- (void) dealloc
-{
-    as_release(_bundleName);
-    as_release(_userInfo);
-    as_release(_sink);
-    as_release(_crashReportStore);
-    as_release(_logFilePath);
-    as_release(_nextCrashID);
-    as_superdealloc();
 }
 
 
@@ -181,36 +149,37 @@ failed:
 #pragma mark - API -
 // ============================================================================
 
+- (NSDictionary*) userInfo
+{
+   return _userInfo;
+}
+
 - (void) setUserInfo:(NSDictionary*) userInfo
 {
-    NSError* error = nil;
-    NSData* userInfoJSON = nil;
-    if(userInfo != nil)
+    @synchronized (self)
     {
-        userInfoJSON = [self nullTerminated:[KSJSONCodec encode:userInfo
-                                                        options:KSJSONEncodeOptionSorted
-                                                          error:&error]];
-        if(error != NULL)
+        NSError* error = nil;
+        NSData* userInfoJSON = nil;
+        if(userInfo != nil)
         {
-            KSLOG_ERROR(@"Could not serialize user info: %@", error);
-            return;
+            userInfoJSON = [self nullTerminated:[KSJSONCodec encode:userInfo
+                                                            options:KSJSONEncodeOptionSorted
+                                                              error:&error]];
+            if(error != NULL)
+            {
+                KSLOG_ERROR(@"Could not serialize user info: %@", error);
+                return;
+            }
         }
+        
+        _userInfo = userInfo;
+        kscrash_setUserInfoJSON([userInfoJSON bytes]);
     }
-    
-    as_autorelease_noref(_userInfo);
-    _userInfo = as_retain(userInfo);
-    kscrash_setUserInfoJSON([userInfoJSON bytes]);
 }
 
-- (void) setHandlingCrashTypes:(KSCrashType)handlingCrashTypes
+- (void) setMonitoring:(KSCrashMonitorType)monitoring
 {
-    _handlingCrashTypes = kscrash_setHandlingCrashTypes(handlingCrashTypes);
-}
-
-- (void) setZombieCacheSize:(size_t) zombieCacheSize
-{
-    _zombieCacheSize = zombieCacheSize;
-    kscrash_setZombieCacheSize(zombieCacheSize);
+    _monitoring = kscrash_setMonitoring(monitoring);
 }
 
 - (void) setDeadlockWatchdogInterval:(double) deadlockWatchdogInterval
@@ -219,41 +188,40 @@ failed:
     kscrash_setDeadlockWatchdogInterval(deadlockWatchdogInterval);
 }
 
-- (void) setPrintTraceToStdout:(bool)printTraceToStdout
-{
-    _printTraceToStdout = printTraceToStdout;
-    kscrash_setPrintTraceToStdout(printTraceToStdout);
-}
-
 - (void) setOnCrash:(KSReportWriteCallback) onCrash
 {
     _onCrash = onCrash;
     kscrash_setCrashNotifyCallback(onCrash);
 }
 
-- (void) setSearchThreadNames:(bool)searchThreadNames
+- (void) setSearchThreadNames:(BOOL)searchThreadNames
 {
     _searchThreadNames = searchThreadNames;
     kscrash_setSearchThreadNames(searchThreadNames);
 }
 
-- (void) setSearchQueueNames:(bool)searchQueueNames
+- (void) setSearchQueueNames:(BOOL)searchQueueNames
 {
     _searchQueueNames = searchQueueNames;
     kscrash_setSearchQueueNames(searchQueueNames);
 }
 
-- (void) setIntrospectMemory:(bool) introspectMemory
+- (void) setIntrospectMemory:(BOOL) introspectMemory
 {
     _introspectMemory = introspectMemory;
     kscrash_setIntrospectMemory(introspectMemory);
 }
 
+- (void) setCatchZombies:(BOOL)catchZombies
+{
+    _catchZombies = catchZombies;
+    self.monitoring |= KSCrashMonitorTypeZombie;
+}
+
 - (void) setDoNotIntrospectClasses:(NSArray *)doNotIntrospectClasses
 {
-    as_autorelease_noref(_doNotIntrospectClasses);
-    _doNotIntrospectClasses = as_retain(doNotIntrospectClasses);
-    size_t count = [doNotIntrospectClasses count];
+    _doNotIntrospectClasses = doNotIntrospectClasses;
+    NSUInteger count = [doNotIntrospectClasses count];
     if(count == 0)
     {
         kscrash_setDoNotIntrospectClasses(nil, 0);
@@ -262,42 +230,24 @@ failed:
     {
         NSMutableData* data = [NSMutableData dataWithLength:count * sizeof(const char*)];
         const char** classes = data.mutableBytes;
-        for(size_t i = 0; i < count; i++)
+        for(unsigned i = 0; i < count; i++)
         {
             classes[i] = [[doNotIntrospectClasses objectAtIndex:i] cStringUsingEncoding:NSUTF8StringEncoding];
         }
-        kscrash_setDoNotIntrospectClasses(classes, count);
+        kscrash_setDoNotIntrospectClasses(classes, (int)count);
     }
-}
-
-- (NSString*) crashReportPath
-{
-    return [self.crashReportStore pathToCrashReportWithID:self.nextCrashID];
-}
-
-- (NSString*) recrashReportPath
-{
-    return [self.crashReportStore pathToRecrashReportWithID:self.nextCrashID];
-}
-
-- (NSString*) stateFilePath
-{
-    NSString* stateFilename = [NSString stringWithFormat:@"%@" kCrashStateFilenameSuffix, self.bundleName];
-    return [self.crashReportStore.path stringByAppendingPathComponent:stateFilename];
 }
 
 - (BOOL) install
 {
-    _handlingCrashTypes = kscrash_install([self.crashReportPath UTF8String],
-                                          [self.recrashReportPath UTF8String],
-                                          [self.stateFilePath UTF8String],
-                                          [self.nextCrashID UTF8String]);
-    if(self.handlingCrashTypes == 0)
+    _monitoring = kscrash_install(self.bundleName.UTF8String,
+                                          self.basePath.UTF8String);
+    if(self.monitoring == 0)
     {
         return false;
     }
 
-#ifdef __IPHONE_OS_VERSION_MAX_ALLOWED
+#if KSCRASH_HAS_UIAPPLICATION
     NSNotificationCenter* nCenter = [NSNotificationCenter defaultCenter];
     [nCenter addObserver:self
                 selector:@selector(applicationDidBecomeActive)
@@ -320,14 +270,31 @@ failed:
                     name:UIApplicationWillTerminateNotification
                   object:nil];
 #endif
+#if KSCRASH_HAS_NSEXTENSION
+    NSNotificationCenter* nCenter = [NSNotificationCenter defaultCenter];
+    [nCenter addObserver:self
+                selector:@selector(applicationDidBecomeActive)
+                    name:NSExtensionHostDidBecomeActiveNotification
+                  object:nil];
+    [nCenter addObserver:self
+                selector:@selector(applicationWillResignActive)
+                    name:NSExtensionHostWillResignActiveNotification
+                  object:nil];
+    [nCenter addObserver:self
+                selector:@selector(applicationDidEnterBackground)
+                    name:NSExtensionHostDidEnterBackgroundNotification
+                  object:nil];
+    [nCenter addObserver:self
+                selector:@selector(applicationWillEnterForeground)
+                    name:NSExtensionHostWillEnterForegroundNotification
+                  object:nil];
+#endif
     
     return true;
 }
 
 - (void) sendAllReportsWithCompletion:(KSCrashReportFilterCompletion) onCompletion
 {
-    [self.crashReportStore pruneReportsLeaving:KSCRASH_MaxStoredReports];
-    
     NSArray* reports = [self allReports];
     
     KSLOG_INFO(@"Sending %d crash reports", [reports count]);
@@ -343,52 +310,46 @@ failed:
          if((self.deleteBehaviorAfterSendAll == KSCDeleteOnSucess && completed) ||
             self.deleteBehaviorAfterSendAll == KSCDeleteAlways)
          {
-             [self deleteAllReports];
+             kscrash_deleteAllReports();
          }
-         kscrash_i_callCompletion(onCompletion, filteredReports, completed, error);
+         kscrash_callCompletion(onCompletion, filteredReports, completed, error);
      }];
 }
 
 - (void) deleteAllReports
 {
-    [self.crashReportStore deleteAllReports];
+    kscrash_deleteAllReports();
 }
 
 - (void) reportUserException:(NSString*) name
                       reason:(NSString*) reason
+                    language:(NSString*) language
                   lineOfCode:(NSString*) lineOfCode
                   stackTrace:(NSArray*) stackTrace
+               logAllThreads:(BOOL) logAllThreads
             terminateProgram:(BOOL) terminateProgram
 {
     const char* cName = [name cStringUsingEncoding:NSUTF8StringEncoding];
     const char* cReason = [reason cStringUsingEncoding:NSUTF8StringEncoding];
+    const char* cLanguage = [language cStringUsingEncoding:NSUTF8StringEncoding];
     const char* cLineOfCode = [lineOfCode cStringUsingEncoding:NSUTF8StringEncoding];
-    size_t cStackTraceCount = [stackTrace count];
-    const char** cStackTrace = malloc(sizeof(*cStackTrace) * cStackTraceCount);
-
-    for(size_t i = 0; i < cStackTraceCount; i++)
+    NSError* error = nil;
+    NSData* jsonData = [KSJSONCodec encode:stackTrace options:0 error:&error];
+    if(jsonData == nil || error != nil)
     {
-        cStackTrace[i] = [[stackTrace objectAtIndex:i] cStringUsingEncoding:NSUTF8StringEncoding];
+        KSLOG_ERROR(@"Error encoding stack trace to JSON: %@", error);
+        // Don't return, since we can still record other useful information.
     }
+    NSString* jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+    const char* cStackTrace = [jsonString cStringUsingEncoding:NSUTF8StringEncoding];
 
     kscrash_reportUserException(cName,
                                 cReason,
+                                cLanguage,
                                 cLineOfCode,
                                 cStackTrace,
-                                cStackTraceCount,
+                                logAllThreads,
                                 terminateProgram);
-
-    // If kscrash_reportUserException() returns, we did not terminate.
-    // Set up IDs and paths for the next crash.
-
-    self.nextCrashID = [self generateUUIDString];
-
-    kscrash_reinstall([self.crashReportPath UTF8String],
-                      [self.recrashReportPath UTF8String],
-                      [self.stateFilePath UTF8String],
-                      [self.nextCrashID UTF8String]);
-
-    free((void*)cStackTrace);
 }
 
 // ============================================================================
@@ -410,27 +371,22 @@ SYNTHESIZE_CRASH_STATE_PROPERTY(NSTimeInterval, backgroundDurationSinceLaunch)
 SYNTHESIZE_CRASH_STATE_PROPERTY(int, sessionsSinceLaunch)
 SYNTHESIZE_CRASH_STATE_PROPERTY(BOOL, crashedLastLaunch)
 
-- (NSUInteger) reportCount
+- (int) reportCount
 {
-    return [self.crashReportStore reportCount];
-}
-
-- (NSString*) crashReportsPath
-{
-    return self.crashReportStore.path;
+    return kscrash_getReportCount();
 }
 
 - (void) sendReports:(NSArray*) reports onCompletion:(KSCrashReportFilterCompletion) onCompletion
 {
     if([reports count] == 0)
     {
-        kscrash_i_callCompletion(onCompletion, reports, YES, nil);
+        kscrash_callCompletion(onCompletion, reports, YES, nil);
         return;
     }
     
     if(self.sink == nil)
     {
-        kscrash_i_callCompletion(onCompletion, reports, NO,
+        kscrash_callCompletion(onCompletion, reports, NO,
                                  [NSError errorWithDomain:[[self class] description]
                                                      code:0
                                               description:@"No sink set. Crash reports not sent."]);
@@ -440,70 +396,90 @@ SYNTHESIZE_CRASH_STATE_PROPERTY(BOOL, crashedLastLaunch)
     [self.sink filterReports:reports
                 onCompletion:^(NSArray* filteredReports, BOOL completed, NSError* error)
      {
-         kscrash_i_callCompletion(onCompletion, filteredReports, completed, error);
+         kscrash_callCompletion(onCompletion, filteredReports, completed, error);
      }];
+}
+
+- (NSData*) loadCrashReportJSONWithID:(int64_t) reportID
+{
+    char* report = kscrash_readReport(reportID);
+    if(report != NULL)
+    {
+        return [NSData dataWithBytesNoCopy:report length:strlen(report) freeWhenDone:YES];
+    }
+    return nil;
+}
+
+- (void) doctorReport:(NSMutableDictionary*) report
+{
+    NSMutableDictionary* crashReport = report[@KSCrashField_Crash];
+    if(crashReport != nil)
+    {
+        crashReport[@KSCrashField_Diagnosis] = [[KSCrashDoctor doctor] diagnoseCrash:report];
+    }
+    crashReport = report[@KSCrashField_RecrashReport][@KSCrashField_Crash];
+    if(crashReport != nil)
+    {
+        crashReport[@KSCrashField_Diagnosis] = [[KSCrashDoctor doctor] diagnoseCrash:report];
+    }
+}
+
+- (NSDictionary*) reportWithID:(int64_t) reportID
+{
+    NSData* jsonData = [self loadCrashReportJSONWithID:reportID];
+    if(jsonData == nil)
+    {
+        return nil;
+    }
+
+    NSError* error = nil;
+    NSMutableDictionary* crashReport = [KSJSONCodec decode:jsonData
+                                                   options:KSJSONDecodeOptionIgnoreNullInArray |
+                                                           KSJSONDecodeOptionIgnoreNullInObject |
+                                                           KSJSONDecodeOptionKeepPartialObject
+                                                     error:&error];
+    if(error != nil)
+    {
+        KSLOG_ERROR(@"Encountered error loading crash report %llx: %@", reportID, error);
+    }
+    if(crashReport == nil)
+    {
+        KSLOG_ERROR(@"Could not load crash report");
+        return nil;
+    }
+    [self doctorReport:crashReport];
+
+    return crashReport;
 }
 
 - (NSArray*) allReports
 {
-    return [self.crashReportStore allReports];
+    int reportCount = kscrash_getReportCount();
+    int64_t reportIDs[reportCount];
+    reportCount = kscrash_getReportIDs(reportIDs, reportCount);
+    NSMutableArray* reports = [NSMutableArray arrayWithCapacity:(NSUInteger)reportCount];
+    for(int i = 0; i < reportCount; i++)
+    {
+        NSDictionary* report = [self reportWithID:reportIDs[i]];
+        if(report != nil)
+        {
+            [reports addObject:report];
+        }
+    }
+    
+    return reports;
 }
 
-- (BOOL) redirectConsoleLogsToFile:(NSString*) fullPath overwrite:(BOOL) overwrite
+- (void) setAddConsoleLogToReport:(BOOL) shouldAddConsoleLogToReport
 {
-    if(kslog_setLogFilename([fullPath UTF8String], overwrite))
-    {
-        self.logFilePath = fullPath;
-        return YES;
-    }
-    return NO;
-}
-
-- (BOOL) redirectConsoleLogsToDefaultFile
-{
-    NSString* logFilename = [NSString stringWithFormat:@"%@" kCrashLogFilenameSuffix, self.bundleName];
-    NSString* logFilePath = [self.crashReportStore.path stringByAppendingPathComponent:logFilename];
-    if(![self redirectConsoleLogsToFile:logFilePath overwrite:YES])
-    {
-        KSLOG_ERROR(@"Could not redirect logs to %@", logFilePath);
-        return NO;
-    }
-    return YES;
+    _addConsoleLogToReport = shouldAddConsoleLogToReport;
+    kscrash_setAddConsoleLogToReport(shouldAddConsoleLogToReport);
 }
 
 
 // ============================================================================
 #pragma mark - Utility -
 // ============================================================================
-
-- (BOOL) ensureDirectoryExists:(NSString*) path
-{
-    NSError* error = nil;
-    NSFileManager* fm = [NSFileManager defaultManager];
-    
-    if(![fm fileExistsAtPath:path])
-    {
-        if(![fm createDirectoryAtPath:path
-          withIntermediateDirectories:YES
-                           attributes:nil
-                                error:&error])
-        {
-            KSLOG_ERROR(@"Could not create directory %@: %@.", path, error);
-            return NO;
-        }
-    }
-    
-    return YES;
-}
-
-- (NSString*) generateUUIDString
-{
-    CFUUIDRef uuid = CFUUIDCreate(NULL);
-    NSString* uuidString = (as_bridge_transfer NSString*)CFUUIDCreateString(NULL, uuid);
-    CFRelease(uuid);
-    
-    return as_autorelease(uuidString);
-}
 
 - (NSMutableData*) nullTerminated:(NSData*) data
 {
@@ -518,32 +494,39 @@ SYNTHESIZE_CRASH_STATE_PROPERTY(BOOL, crashedLastLaunch)
 
 
 // ============================================================================
-#pragma mark - Callbacks -
+#pragma mark - Notifications -
 // ============================================================================
 
 - (void) applicationDidBecomeActive
 {
-    kscrashstate_notifyAppActive(true);
+    kscrash_notifyAppActive(true);
 }
 
 - (void) applicationWillResignActive
 {
-    kscrashstate_notifyAppActive(false);
+    kscrash_notifyAppActive(false);
 }
 
 - (void) applicationDidEnterBackground
 {
-    kscrashstate_notifyAppInForeground(false);
+    kscrash_notifyAppInForeground(false);
 }
 
 - (void) applicationWillEnterForeground
 {
-    kscrashstate_notifyAppInForeground(true);
+    kscrash_notifyAppInForeground(true);
 }
 
 - (void) applicationWillTerminate
 {
-    kscrashstate_notifyAppTerminate();
+    kscrash_notifyAppTerminate();
 }
 
 @end
+
+
+//! Project version number for KSCrashFramework.
+const double KSCrashFrameworkVersionNumber = 1.132;
+
+//! Project version string for KSCrashFramework.
+const unsigned char KSCrashFrameworkVersionString[] = "1.13.2";
