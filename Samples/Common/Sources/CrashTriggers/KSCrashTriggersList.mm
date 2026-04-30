@@ -1,0 +1,397 @@
+//
+//  KSCrashTriggersList.mm
+//
+//  Created by Nikolay Volosatov on 2024-06-23.
+//
+//  Copyright (c) 2012 Karl Stenerud. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall remain in place
+// in this source code.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+
+#import "KSCrashTriggersList.h"
+
+#import <mach/mach.h>
+#import <signal.h>
+#import <stdexcept>
+#import <thread>
+#import "CrashCallback.h"
+#import "KSCrash+Hang.h"
+#import "KSCrash.h"
+
+namespace sample_namespace
+{
+class Report
+{
+   public:
+    static void crash() { throw std::runtime_error("C++ exception"); }
+};
+}  // namespace sample_namespace
+
+static void trigger_ns(void)
+{
+    NSException *exc = [NSException exceptionWithName:NSGenericException reason:@"Something broke" userInfo:nil];
+    [exc raise];
+}
+
+static void trigger_cpp(void) { sample_namespace::Report::crash(); }
+
+static void trigger_cpp_backgroundThread(void)
+{
+    std::thread t([]() { sample_namespace::Report::crash(); });
+    t.join();
+}
+
+static void trigger_mach(void)
+{
+    volatile int *ptr = (int *)0x42;
+    *ptr = 42;  // This will cause an EXC_BAD_ACCESS (SIGSEGV)
+}
+
+static void trigger_signal(void)
+{
+    abort();  // This will raise a SIGABRT signal
+}
+
+static void trigger_user_nonfatal(void)
+{
+    [KSCrash.sharedInstance reportUserException:@"User Exception"
+                                         reason:@"My Reason"
+                                       language:@"My Language"
+                                     lineOfCode:@"loc"
+                                     stackTrace:@[ @"trace line 1", @"trace line 2" ]
+                                  logAllThreads:YES
+                               terminateProgram:NO];
+}
+
+static void trigger_user_fatal(void)
+{
+    [KSCrash.sharedInstance reportUserException:@"User Exception"
+                                         reason:@"My Reason"
+                                       language:@"My Language"
+                                     lineOfCode:@"loc"
+                                     stackTrace:@[ @"trace line 1", @"trace line 2" ]
+                                  logAllThreads:YES
+                               terminateProgram:YES];
+}
+
+extern "C" void KSStacktraceCheckCrash() __attribute__((disable_tail_calls));
+NSString *const KSCrashStacktraceCheckFuncName = @"KSStacktraceCheckCrash";
+void KSStacktraceCheckCrash() __attribute__((disable_tail_calls))
+{
+    NSException *exc = [NSException exceptionWithName:NSGenericException reason:@"Stacktrace Check" userInfo:nil];
+    [exc raise];
+}
+
+NSString *const KSCrashNSExceptionStacktraceFuncName = @"exceptionWithStacktraceForException";
+
+@implementation KSCrashTriggersList
+
++ (void)trigger_nsException_genericNSException
+{
+    NSException *exc = [NSException exceptionWithName:NSGenericException reason:@"Test" userInfo:@{ @"a" : @"b" }];
+    [exc raise];
+}
+
++ (void)trigger_nsException_nsArrayOutOfBounds
+{
+    NSArray *array = @[ @1, @2, @3 ];
+    [array objectAtIndex:10];  // This will throw an NSRangeException
+}
+
++ (void)trigger_nsException_user
+{
+    [KSCrash.sharedInstance reportNSException:[NSException exceptionWithName:@"Custom Exception"
+                                                                      reason:@"Custom reason"
+                                                                    userInfo:NULL]
+                                logAllThreads:YES];
+}
+
++ (void)trigger_cpp_runtimeException
+{
+    trigger_cpp();
+}
+
++ (void)trigger_cpp_runtimeExceptionBackgroundThread
+{
+    trigger_cpp_backgroundThread();
+}
+
++ (void)trigger_mach_badAccess
+{
+    volatile int *ptr = (int *)0x42;
+    *ptr = 42;  // This will cause an EXC_BAD_ACCESS (SIGSEGV)
+}
+
++ (void)trigger_mach_badAccessDeadbeef
+{
+    // Reproducer from https://github.com/kstenerud/KSCrash/issues/810
+    NSObject *a = (__bridge NSObject *)(void *)0xDEADBEEF;
+    [a class];
+}
+
++ (void)trigger_mach_busError
+{
+    char *ptr = (char *)malloc(sizeof(int));
+    int *intPtr = (int *)(ptr + 1);  // Misaligned pointer
+    *intPtr = 42;                    // This will cause an EXC_BAD_ACCESS (SIGBUS)
+    free(ptr);
+}
+
++ (void)trigger_mach_illegalInstruction
+{
+    void (*funcPtr)() = (void (*)())0xDEADBEEF;
+    funcPtr();  // This will cause an EXC_BAD_INSTRUCTION
+}
+
++ (void)trigger_signal_abort
+{
+    abort();  // This will raise a SIGABRT signal
+}
+
++ (void)trigger_user_nonfatal
+{
+    trigger_user_nonfatal();
+}
+
++ (void)trigger_user_fatal
+{
+    trigger_user_fatal();
+}
+
++ (void)trigger_memory_oom
+{
+    // Allocate memory in 500 MiB chunks on a background queue until the
+    // system kills us. Done off the main thread so the watchdog monitor
+    // doesn't misclassify this as a hang.
+    // Requires KSCRASH_SIM_MEMORY_TERMINATION_ENABLED=1 in the environment
+    // so the simulator OOM simulation fires SIGKILL at terminal level.
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        const size_t chunkSize = 500 * 1024 * 1024;  // 500 MiB
+        NSMutableArray *chunks = [NSMutableArray array];
+        while (true) {
+            void *chunk = malloc(chunkSize);
+            if (chunk == NULL) {
+                break;
+            }
+            memset(chunk, 0xFF, chunkSize);
+            [chunks addObject:[NSValue valueWithPointer:chunk]];
+        }
+    });
+    // Keep main thread alive and responsive while background allocates.
+    // SIGKILL will terminate the process before this expires.
+    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:100.0]];
+}
+
++ (void)trigger_other_manyThreads
+{
+    NSUInteger const threadsCount = 1005;
+    static NSMutableArray *allThreads = [NSMutableArray arrayWithCapacity:threadsCount + 1];
+
+    for (NSUInteger idx = 0; idx < threadsCount; ++idx) {
+        NSThread *thread = [[NSThread alloc] initWithBlock:^{
+            // Sleep forever by making short "sleep" calls
+            while (YES) {
+                [NSThread sleepForTimeInterval:0.01];
+            }
+        }];
+        [thread start];
+        [allThreads addObject:thread];
+    }
+
+    NSThread *thread = [[NSThread alloc] initWithBlock:^{
+        // Sleep 100ms to ensure other threads are running
+        [NSThread sleepForTimeInterval:0.1];
+
+        // And then actually crash (specifically in the last thread)
+        KSStacktraceCheckCrash();
+    }];
+    [thread start];
+    [allThreads addObject:thread];
+}
+
++ (void)trigger_other_stackOverflow
+{
+    [self trigger_other_stackOverflow];
+}
+
++ (void)trigger_other_watchdogTimeoutTermination
+{
+    // Schedule a SIGKILL from a background queue to terminate the app
+    // while the main thread is hung, simulating a watchdog termination
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                       kill(getpid(), SIGKILL);
+                   });
+
+    // Block the main thread to trigger hang detection
+    // The watchdog monitor should detect this and record a hang report
+    [NSThread sleepForTimeInterval:100.0];
+}
+
++ (void)trigger_other_appHang
+{
+    // Block the main thread long enough for the watchdog to detect a hang
+    // (threshold is 250ms), then spin the run loop so the BeforeWaiting
+    // observer fires and finalizes the recovered hang report in-place.
+    [NSThread sleepForTimeInterval:2.0];
+    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
+}
+
++ (void)trigger_other_sigkill
+{
+    kill(getpid(), SIGKILL);
+}
+
++ (void)trigger_other_watchdogTimeoutWithException
+{
+    // Register a hang observer to throw an exception once a hang is detected.
+    // This ensures the exception occurs while we're definitely in a hang state.
+    static id observerToken = nil;
+    observerToken = [KSCrash.sharedInstance
+        addHangObserver:^(KSHangChangeType change, uint64_t startTimestamp, uint64_t endTimestamp) {
+            if (change == KSHangChangeTypeStarted) {
+                // Hang detected - throw exception from background thread
+                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                    NSException *exc = [NSException exceptionWithName:NSGenericException
+                                                               reason:@"Exception during hang"
+                                                             userInfo:nil];
+                    [exc raise];
+                });
+            }
+        }];
+
+    // Block the main thread to trigger hang detection
+    [NSThread sleepForTimeInterval:100.0];
+}
+
+#define TRIGGER_MULTIPLE(TYPE_A, TYPE_B)                                                               \
+    setIntegrationTestIsWritingReportCallback(                                                         \
+        ^(const KSCrash_ExceptionHandlingPlan *const plan, const struct KSCrashReportWriter *writer) { \
+            if (!plan->crashedDuringExceptionHandling) {                                               \
+                trigger_##TYPE_B();                                                                    \
+            }                                                                                          \
+        });                                                                                            \
+    trigger_##TYPE_A()
+
++ (void)trigger_multiple_mach_mach
+{
+    TRIGGER_MULTIPLE(mach, mach);
+}
++ (void)trigger_multiple_mach_signal
+{
+    TRIGGER_MULTIPLE(mach, signal);
+}
++ (void)trigger_multiple_mach_cpp
+{
+    TRIGGER_MULTIPLE(mach, cpp);
+}
++ (void)trigger_multiple_mach_ns
+{
+    TRIGGER_MULTIPLE(mach, ns);
+}
++ (void)trigger_multiple_mach_user
+{
+    TRIGGER_MULTIPLE(mach, user_nonfatal);
+}
+
++ (void)trigger_multiple_signal_mach
+{
+    TRIGGER_MULTIPLE(signal, mach);
+}
++ (void)trigger_multiple_signal_signal
+{
+    TRIGGER_MULTIPLE(signal, signal);
+}
++ (void)trigger_multiple_signal_cpp
+{
+    TRIGGER_MULTIPLE(signal, cpp);
+}
++ (void)trigger_multiple_signal_ns
+{
+    TRIGGER_MULTIPLE(signal, ns);
+}
++ (void)trigger_multiple_signal_user
+{
+    TRIGGER_MULTIPLE(signal, user_nonfatal);
+}
+
++ (void)trigger_multiple_cpp_mach
+{
+    TRIGGER_MULTIPLE(cpp, mach);
+}
++ (void)trigger_multiple_cpp_signal
+{
+    TRIGGER_MULTIPLE(cpp, signal);
+}
++ (void)trigger_multiple_cpp_cpp
+{
+    TRIGGER_MULTIPLE(cpp, cpp);
+}
++ (void)trigger_multiple_cpp_ns
+{
+    TRIGGER_MULTIPLE(cpp, ns);
+}
++ (void)trigger_multiple_cpp_user
+{
+    TRIGGER_MULTIPLE(cpp, user_nonfatal);
+}
+
++ (void)trigger_multiple_ns_mach
+{
+    TRIGGER_MULTIPLE(ns, mach);
+}
++ (void)trigger_multiple_ns_signal
+{
+    TRIGGER_MULTIPLE(ns, signal);
+}
++ (void)trigger_multiple_ns_cpp
+{
+    TRIGGER_MULTIPLE(ns, cpp);
+}
++ (void)trigger_multiple_ns_ns
+{
+    TRIGGER_MULTIPLE(ns, ns);
+}
++ (void)trigger_multiple_ns_user
+{
+    TRIGGER_MULTIPLE(ns, user_nonfatal);
+}
+
++ (void)trigger_multiple_user_mach
+{
+    TRIGGER_MULTIPLE(user_fatal, mach);
+}
++ (void)trigger_multiple_user_signal
+{
+    TRIGGER_MULTIPLE(user_fatal, signal);
+}
++ (void)trigger_multiple_user_cpp
+{
+    TRIGGER_MULTIPLE(user_fatal, cpp);
+}
++ (void)trigger_multiple_user_ns
+{
+    TRIGGER_MULTIPLE(user_fatal, ns);
+}
++ (void)trigger_multiple_user_user
+{
+    TRIGGER_MULTIPLE(user_fatal, user_nonfatal);
+}
+
+@end

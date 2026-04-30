@@ -1,3 +1,40 @@
+1.15.2:
+
+Added HTTP report submission to Android.
+
+Cleaned up Objective-C introspection.
+
+Added new option to print the last recorded console log on startup (for debugging).
+
+Added CrashProbe's crashes to the Crash-Tester app. Note that many of these crashes are improperly marked "noreturn", which completely breaks crash reporting (the only noreturn function you'd ever actually call is abort(), and it provides a proper trace to the signal handler). Others, such as "Smash Stack Bottom", are pretty much useless since there's no reliable way to deal with that in the wild.
+
+
+1.15.1:
+
+Added version fields to binary images.
+
+
+1.15.0:
+
+Removed at-crash thread name and queue name searching since they can't be made async-safe without some nasty hacks.
+
+- REMOVED KSCrash.searchThreadNames
+- REMOVED KSCrash.searchQueueNames
+
+
+1.14.0:
+
+VERY minimal, experimental Android support. Don't expect much from this yet.
+
+Added new monitor mode KSCrashMonitorTypeManual, which effectively disables any automatic crash reporting.
+
+
+1.13.3:
+
+Fixed bad dynamic library reference in the Mac project file.
+
+- ADDED   KSCrash.systemInfo
+
 1.13.1:
 
 Replaced backtrace system with stack walkers.

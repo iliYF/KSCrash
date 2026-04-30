@@ -20,4 +20,30 @@ Thumbs.db
 .~*
 *.orig
 *.xccheckout
+*.xcscmblueprint
 Carthage/Build
+### SPM ###
+.build
+.swiftpm/xcode/xcuserdata
+.swiftpm/package.xcworkspace/xcuserdata
+### Ruby ###
+Gemfile.lock
+### Samples ###
+/Samples/Common/.swiftpm
+/Samples/**/Derived
+/Samples/**/*.xcodeproj
+/Samples/**/*.xcworkspace
+### CLAUDE ###
+**/.claude/settings.local.json
+**/CLAUDE.local.md
+/Benchmarks/Derived
+/Benchmarks/KSCrashBenchmarks.xcodeproj
+/Benchmarks/KSCrashBenchmarks.xcworkspace
+/.github/scripts/__pycache__
+Benchmarks/benchmark_results.md
+/Benchmarks/build
+### Infer ###
+infer-out/
+compile_commands.json
+compile_commands_c_only.json
+/Derived

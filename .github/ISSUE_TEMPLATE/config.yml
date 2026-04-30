@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions? Ask in KSCrash Discussions!
+    url: https://github.com/kstenerud/KSCrash/discussions/new/choose
+    about: Have a question about KSCrash? Don't open an issue — ask the community in Discussions!

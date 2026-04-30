@@ -1,0 +1,103 @@
+name: Run Unit Tests
+
+on:
+  pull_request:
+    paths:
+      - "Sources/**"
+      - "Tests/**"
+      - "Package.swift"
+      - ".github/workflows/unit-tests.yml"
+      - ".swiftpm/xcode/xcshareddata/xcschemes/**"
+
+  push:
+    branches:
+      - master
+
+  schedule:
+    - cron: "0 0 1 * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    runs-on: "macos-${{ matrix.macos-version || 'latest' }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: iOS
+            macos-version: "15"
+          - platform: iOS
+            xcode-version: "latest-stable"
+            macos-version: "15"
+          - platform: iOS
+            platform-version: ~18.2
+            macos-version: "14"
+            xcode-version: "16.2"
+
+          - platform: watchOS
+            macos-version: "15"
+          - platform: watchOS
+            platform-version: ~11.1
+            macos-version: "14"
+            xcode-version: "16.2"
+
+          - platform: tvOS
+            macos-version: "15"
+          - platform: tvOS
+            platform-version: ~18.2
+            macos-version: "14"
+            xcode-version: "16.2"
+
+          - platform: visionOS
+            macos-version: "15"
+
+          - platform: macOS
+          - platform: macOS
+            macos-version: "14"
+          - platform: macOS
+            arch: x86_64
+            macos-version: "15"
+
+          - platform: mac-catalyst
+          - platform: mac-catalyst
+            macos-version: "14"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Use Latest Stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ matrix.xcode-version || 'latest-stable' }}
+
+      - name: Ensure the Platform is Downloaded
+        if: ${{ matrix.platform != 'macOS' && matrix.platform != 'mac-catalyst' }}
+        run: |
+          xcodebuild -runFirstLaunch
+          xcrun simctl list
+          xcodebuild -downloadPlatform ${{ matrix.platform }}
+          xcodebuild -runFirstLaunch
+
+      - name: Run Unit Tests
+        if: ${{ matrix.arch != 'x86_64' }}
+        uses: mxcl/xcodebuild@v3
+        timeout-minutes: 30
+        with:
+          workspace: ".swiftpm/xcode/package.xcworkspace"
+          scheme: "KSCrash-Package"
+          platform: ${{ matrix.platform }}
+          platform-version: ${{ matrix.platform-version }}
+
+      - name: Run Unit Tests (x86_64 via Rosetta)
+        if: ${{ matrix.arch == 'x86_64' }}
+        timeout-minutes: 30
+        run: |
+          brew install xcbeautify
+          set -o pipefail && xcodebuild test \
+            -workspace .swiftpm/xcode/package.xcworkspace \
+            -scheme KSCrash-Package \
+            -destination 'platform=macOS,arch=x86_64' \
+            | xcbeautify
